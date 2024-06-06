@@ -1,0 +1,17 @@
+[tool.poetry]
+name = "cifar100"
+version = "0.1.0"
+description = ""
+authors = ["Your Name <you@example.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+torch = "^2.3.1"
+efficientnet-pytorch = "^0.7.1"
+torchvision = "^0.18.1"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
