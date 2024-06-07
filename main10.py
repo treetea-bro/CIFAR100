@@ -54,7 +54,7 @@ def main():
     transform_train = transforms.Compose(
         [
             # 보간 기법으로 BILINEAR를 사용하여 160x160사이즈로 이미지를 변환시킨다.
-            # transforms.Resize(160),
+            transforms.Resize(160),
             # default 값은 0.5이며, 50% 확률로 이미지 좌우를 반전시킨다.
             transforms.RandomHorizontalFlip(),
             # 이미지를 파이토치의 텐서 객체로 변환하여 trainable하게 변환시킨다.
@@ -71,7 +71,7 @@ def main():
     transform_test = transforms.Compose(
         [
             # 보간 기법으로 BILINEAR를 사용하여 200x200사이즈로 이미지를 변환시킨다.
-            # transforms.Resize(200),
+            transforms.Resize(200),
             transforms.ToTensor(),
             # 학습때와 같이 정규화를 진행하여 같은 환경을 만들어 줌으로 써
             # 더 정답을 잘 맞출 수 있도록 한다.

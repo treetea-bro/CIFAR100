@@ -36,7 +36,7 @@ class Cutout:
     """랜덤한 위치와 크기의 정사각형으로 이미지의 일부분을 검은색으로 변환하여
     학습 시에 모델이 좀 더 보편적으로 이미지를 학습할 수 있게 도와주는 기법(즉 일반화를 뜻함)"""
 
-    def __init__(self, min_side=4, max_side=12, p=0.5):
+    def __init__(self, min_side=30, max_side=60, p=0.5):
         self.max_side = max_side  # 정사각형 한변의 최대 길이
         self.min_side = min_side  # 정사각형 한변의 최소 길이
         self.p = p  # cutout을 진행할 확률
