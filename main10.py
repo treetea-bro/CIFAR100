@@ -47,6 +47,10 @@ def main():
     )
     print("device : ", device)
 
+    # 데이터로더에서 사용할 배치사이즈.
+    # batch는 입력으로 받은 batch 값때마다 역전파를 진행하겠다는 의미이고,
+    # batch_split은 입력으로 받은 batch_split 간격까지 gradient accumulation 하겠다는 의미.
+    # 자세한건 아래 코드에서..
     mini_batch_size = args.batch // args.batch_split
 
     #  각 이미지에 적용할 변형기법을 파이프라인으로 정의
@@ -54,6 +58,8 @@ def main():
     transform_train = transforms.Compose(
         [
             # 보간 기법으로 BILINEAR를 사용하여 160x160사이즈로 이미지를 변환시킨다.
+            # 보간 기법을 적용하면 이미지 해상도가 낮아져서 성능이 안좋을줄 알았지만,
+            # efficientnet 특성상 이미지 크기가 커야 학습 성능이 더 잘나온다.
             transforms.Resize(160),
             # default 값은 0.5이며, 50% 확률로 이미지 좌우를 반전시킨다.
             transforms.RandomHorizontalFlip(),
@@ -95,13 +101,19 @@ def main():
     criterion = nn.CrossEntropyLoss()
 
     def mixup_data(x: Tensor, y, alpha=1.0, lam=1.0, count=0):
-        """Returns mixed inputs, pairs of targets, and lambda"""
+        """입력으로 받은 x에 해당하는 이미지들을 mixup해서 데이터 증강
+        효과를 볼 수 있게하는 함수"""
+        # count가 0이 되는 주기마다 alpha값이 존재할 시 mixup을 진행한다.
+        # count의 주기는 args.batch_split이 결정하며,
+        # 현재 코드에선 args.batch_split이 1이고, 매 번 mixup을 진행한다.
         if count == 0:
             if alpha > 0:
                 # 현재 args 값에 alpha는 0.1로 설정되어있어서
                 # lam의 값은 0이나 1에 가까운 값이 난수로 생성되게 된다.
                 lam = np.random.beta(alpha, alpha)
             else:
+                # lambda가 1인 경우는 mixup을 하지 않는다.
+                # 현재 이 코드에선 alpha가 존재하기 때문에 매번 mixup한다.
                 lam = 1.0
 
         # 매 미니배치(32)마다 이 함수가 호출되는데, 그때마다
@@ -118,6 +130,9 @@ def main():
         return mixed_x, y_a, y_b, lam
 
     def mixup_criterion(criterion, pred, y_a, y_b, lam):
+        """loss function(criterion)과 모델의 예측값, mixup 라벨 2개를 받아서
+        각각 라벨당 오차를 계산하고 더한 뒤 리턴한다.
+        lam값이 1일 경우 y_a에 대한 loss값만 리턴한다."""
         return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
     # Training
