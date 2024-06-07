@@ -206,7 +206,7 @@ def main():
         trainset, batch_size=mini_batch_size, shuffle=True, num_workers=1
     )
 
-    net = EfficientNet.from_pretrained("efficientnet-b4", num_classes=100)
+    net = EfficientNet.from_pretrained("efficientnet-b7", num_classes=100)
     net = net.to(device)
     namesave = "./checkpoint/ckpt"
     optimizer = optim.SGD(
