@@ -12,6 +12,7 @@ import numpy as np
 from utils import progress_bar
 from efficientnet_pytorch import EfficientNet
 from cutout import Cutout
+from pathlib import Path
 
 
 def main():
@@ -30,6 +31,21 @@ def main():
         default=0.1,
         type=float,
         help="mixup interpolation coefficient (default: 1)",
+    )
+    parser.add_argument(
+        "--model", default="efficientnet-b7", type=str, help="model name"
+    )
+    parser.add_argument(
+        "--checkpoint_save_directory",
+        default="./checkpoint",
+        type=str,
+        help="checkpoint_save_directory",
+    )
+    parser.add_argument(
+        "--checkpoint_threshold",
+        default=90.0,
+        type=float,
+        help="checkpoint_threshold",
     )
 
     args = parser.parse_args()
@@ -124,8 +140,10 @@ def main():
         index = torch.randperm(batch_size).to(device)
 
         # 위에서 난수로 구한 lam값과 기존 배치 0-31 인덱스와
-        # 랜덤순열로 구한 인덱스를 가지고 이미지들과 라벨들을 mix한다.
+        # 랜덤순열로 구한 인덱스를 가지고 이미지들을 mix한다.
         mixed_x = lam * x + (1 - lam) * x[index, :]
+
+        # y_a는 0-31인덱스의 정답, y_b는 mixup에 사용된 이미지들의 정답
         y_a, y_b = y, y[index]
         return mixed_x, y_a, y_b, lam
 
@@ -136,53 +154,136 @@ def main():
         return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
     # Training
-    def train(epoch, trainloader):
+    def train(epoch, trainloader) -> tuple[Path, float]:
+        """모델 학습을 담당하는 함수"""
+        # 현재 Epoch가 몇번째인지 출력한다.
         print("\nEpoch: %d" % epoch)
+        # 모델을 학습모드로 설정한다.
+        # 학습모드에서는 gradient 계산 및 dropoutd이 활성화된다.
         net.train()
+
+        # 현재 epoch에서의 가장 높은 정확도를 구한다.
+        # checkpoint 저장 시에 활용된다.
+        max_accuracy = 0.0
+
+        # 아래 4개의 지역변수들은 progress_bar 출력을 위해 사용된다.
         train_loss = 0
         correct = 0
         total = 0
         count = 0
+
+        # lam 지역변수는 mixup에서 모델의 예측값이 정답인지 확인할 때 쓴다.
+        # mixup_data 함수를 거쳐나오면 lam값이 mutable하게 변하기때문에 항상 1.0이지는 않다.
         lam = 1.0
+
+        # 학습 시작 전에 optimizer의 gradient들을 초기화 해준다.
         optimizer.zero_grad()
+
+        saving_ckpt_path = Path("")
+        # trainloader에서 설정한 미니배치 단위의 묶음으로 이미지와 정답라벨을 순회하며 가져온다.
+        # batch_idx는 progress_bar 출력을 위해 사용된다.
         for batch_idx, (inputs, targets) in enumerate(trainloader):
+            # count가 batch_split과 같아지면 loss function에서 누적계산 해놓은 값을 업데이트한다.
+            # batch_split과 같아지기위해 count는 매 루프마다 1씩 증가하는 코드가 아래 존재한다.
             if count == args.batch_split:
+                # gradient를 업데이트 한다.
                 optimizer.step()
+                # 새 업데이트를 위해 이전 업데이트에 사용된 값들을 초기화한다.
                 optimizer.zero_grad()
+                # count를 0으로 맞춰주어서 일정 주기마다 이 if문 안으로 들어올 수 있도록 한다.
+                # 예를들어 batch_split이 2라면 짝수 주기로 gradient 업데이트를하고,
+                # 1이면 매 루프마다 업데이트한다.
                 count = 0
+            # batch_split 주기마다 gradient 업데이트 하기위해 count를 1씩 증가해준다.
+            count += 1
+            # GPU를 사용할 수 있다면 tensor 객체를 GPU에 적재하고, 그렇지 않다면 CPU에 적재한다.
             inputs, targets = inputs.to(device), targets.to(device)
+
+            # inputs: mixup된 이미지
+            # targets_a: mixup 중 alpha에 해당하는 이미지 정답라벨
+            # targets_b: mixup 중 beta에 해당하는 이미지 정답라벨
+            # lam: 이미지 섞인 비율 값
             inputs, targets_a, targets_b, lam = mixup_data(
                 inputs, targets, args.alpha, lam, count
             )
+            # efficientnet-b7에 mixup 이미지를 넣어서 predict한다.
             outputs = net(inputs)
+            # mixup 이미지의 loss를 계산하는 함수를 이용하여 loss를 계산한다.
             loss = mixup_criterion(criterion, outputs, targets_a, targets_b, lam)
+            # batch_split이 2 이상이면 gradient accumulation을 진행하니,
+            # loss를 일부분씩만 각각 미니배치에서 취해서 누적계산을 진행한다.
             loss = loss / args.batch_split
+            # 역전파 진행
             loss.backward()
-            count += 1
+
+            # 매 루프마다 train_loss를 누적증가 시킨다.
             train_loss += loss.item()
+            # 모델이 예측한 확률 중 가장 높은 라벨만 골라서 추출한다.
+            # 1차원 벡터에 32개의 값들이 추출된다. (batch_size가 32여서)
             _, predicted = outputs.max(1)
+            # 현 배치의 개수만큼 total에 누적합 한다.
             total += targets.size(0)
+            # mixup 이미지를 대상으로 했기때문에 정답을 계산하는 방식도 다르다.
+            # target a와 b를 모델이 맞췄다면 lam을 활용해서 비율 조정해서 맞았다고 처리한다.
             correct += (
                 lam * predicted.eq(targets_a.data).cpu().sum().float()
                 + (1 - lam) * predicted.eq(targets_b.data).cpu().sum().float()
             )
+            # accuracy : 전체데이터/  맞은 비율 * 100.0
+            acc = 100.0 * correct / total
+
+            # 모델의 학습진행상태를 출력한다.
             progress_bar(
                 batch_idx,
                 len(trainloader),
                 "Loss: %.3f | Acc: %.3f%% (%d/%d)"
                 % (
                     train_loss / (batch_idx + 1),
-                    100.0 * correct / total,
+                    acc,
                     correct,
                     total,
                 ),
             )
 
-    def test(testloader, namesave):
+            # 모델이 예측한 정확도가 checkpoint threshold 이상이고, 이전 max를 넘었다면
+            # checkpoint를 저장한다.
+            if acc > args.checkpoint_threshold and max_accuracy < acc.item():
+                max_accuracy = round(acc.item(), 2)
+                saving_ckpt_path = Path(args.checkpoint_save_directory) / Path(
+                    f"{args.model}_{max_accuracy}.pt"
+                )
+                print(f"Saving model : {saving_ckpt_path}")
+                state = {
+                    "net": net.state_dict(),
+                    "acc": acc,
+                }
+                # checkpoint 폴더가 존재하지 않으면 만들어준다.
+                if not os.path.isdir(args.checkpoint_save_directory):
+                    os.mkdir(args.checkpoint_save_directory)
+                torch.save(state, saving_ckpt_path)
+
+        return saving_ckpt_path, max_accuracy
+
+    def test(testloader, saving_ckpt_path: Path) -> None:
+        """모델 평가를 담당하는 함수"""
+        # checkpoint 가 존재하지 않는다면 테스트를 진행하지 않는 guard
+        if not (saving_ckpt_path.exists() and saving_ckpt_path.is_file()):
+            print("입력하신 체크포인트 파일이 경로에 존재하지 않습니다.")
+            return
+
+        # 모델을 평가모드로 전환해서 dropout 및 gredient 변동이 일어나지 않게한다.
         net.eval()
+        print("Loading checkpoint..")
+        # 체크포인트를 load한다.
+        checkpoint = torch.load(saving_ckpt_path)
+        # load한 체크포인트를 모델에 적용한다.
+        net.load_state_dict(checkpoint["net"])
+
         test_loss = 0
         correct = 0
         total = 0
+        print(f"{'-' * 10} 모델 테스트 시작 {'-' * 10}")
+        # gradient를 계산하지 않는 상태에서 모델의 정확도를 측정한다.
         with torch.no_grad():
             for batch_idx, (inputs, targets) in enumerate(testloader):
                 inputs, targets = inputs.to(device), targets.to(device)
@@ -203,17 +304,11 @@ def main():
                         total,
                     ),
                 )
-        # Save checkpoint.
-        acc = 100.0 * correct / total
-        print("Saving..")
-        state = {
-            "net": net.state_dict(),
-            "acc": acc,
-        }
-        if not os.path.isdir("checkpoint"):
-            os.mkdir("checkpoint")
-        torch.save(state, namesave)
 
+    # 데이터로더를 이용해서 배치사이즈 크기별로 iterate 할 수 있도록 한다.
+    # 테스트는 shuffle을 하든 안하든 상관없기 때문에 성능상의 이유로 False이고,
+    # 트레인은 shuffle을 해야 매 에포크 및 미니배치마다 다양한 조합의 이미지들이
+    # 배치 정규화 및 mixup 되기때문에 하면 일반화 및 모델 성능에 좋다.
     testloader = torch.utils.data.DataLoader(
         testset, batch_size=10, shuffle=False, num_workers=1
     )
@@ -221,19 +316,35 @@ def main():
         trainset, batch_size=mini_batch_size, shuffle=True, num_workers=1
     )
 
-    net = EfficientNet.from_pretrained("efficientnet-b7", num_classes=100)
+    # 모델은 EfficientNet을 이용한다.
+    net = EfficientNet.from_pretrained(args.model, num_classes=100)
     net = net.to(device)
-    namesave = "./checkpoint/ckpt"
     optimizer = optim.SGD(
         net.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.wd
     )
+    # StepLR을 이용해서 에포크가 진행될수록 lr를 점점 줄이도록 한다.
     lr_sc = lr_scheduler.StepLR(optimizer, step_size=args.nsc, gamma=args.gamma)
+
+    # train
+    highest_model_path = Path("")
+    max_accuracy = 0.0
     for epoch in range(0, args.ne):
-        train(epoch, trainloader)
+        model_path, accuracy = train(epoch, trainloader)
+        # 전체 에포크 중에서 가장 높은 정확도를 가진 모델을 구한다.
+        # 그 모델로 나중에 test함수에 넣어서 평가하기 위한 용도이다.
+        if max_accuracy < accuracy:
+            max_accuracy = accuracy
+            highest_model_path = model_path
+        # learning rate를 줄인다.
         lr_sc.step()
 
-    print("Test accuracy : ")
-    test(testloader, namesave)
+    if str(highest_model_path) == "":
+        print(
+            "checkpoint_threshold가 너무 높아 모델이 저장되지 않았습니다.\nthreshhold arg를 낮춰주세요."
+        )
+        return
+
+    test(testloader, highest_model_path)
 
 
 if __name__ == "__main__":
