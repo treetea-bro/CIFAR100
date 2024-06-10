@@ -1,4 +1,3 @@
-from __future__ import print_function
 import torch
 from torch.functional import Tensor
 import torch.nn as nn
@@ -13,6 +12,7 @@ from utils import progress_bar
 from efficientnet_pytorch import EfficientNet
 from cutout import Cutout
 from pathlib import Path
+import fnmatch
 
 
 def main():
@@ -153,8 +153,7 @@ def main():
         lam값이 1일 경우 y_a에 대한 loss값만 리턴한다."""
         return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
-    # Training
-    def train(epoch, trainloader) -> tuple[Path, float]:
+    def train(epoch, trainloader) -> None:
         """모델 학습을 담당하는 함수"""
         # 현재 Epoch가 몇번째인지 출력한다.
         print("\nEpoch: %d" % epoch)
@@ -162,9 +161,9 @@ def main():
         # 학습모드에서는 gradient 계산 및 dropoutd이 활성화된다.
         net.train()
 
-        # 현재 epoch에서의 가장 높은 정확도를 구한다.
+        # 현재 epoch에서의 정확도를 구한다.
         # checkpoint 저장 시에 활용된다.
-        max_accuracy = 0.0
+        epoch_acc = 0.0
 
         # 아래 4개의 지역변수들은 progress_bar 출력을 위해 사용된다.
         train_loss = 0
@@ -179,7 +178,6 @@ def main():
         # 학습 시작 전에 optimizer의 gradient들을 초기화 해준다.
         optimizer.zero_grad()
 
-        saving_ckpt_path = Path("")
         # trainloader에서 설정한 미니배치 단위의 묶음으로 이미지와 정답라벨을 순회하며 가져온다.
         # batch_idx는 progress_bar 출력을 위해 사용된다.
         for batch_idx, (inputs, targets) in enumerate(trainloader):
@@ -229,8 +227,9 @@ def main():
                 lam * predicted.eq(targets_a.data).cpu().sum().float()
                 + (1 - lam) * predicted.eq(targets_b.data).cpu().sum().float()
             )
-            # accuracy : 전체데이터/  맞은 비율 * 100.0
+            # accuracy : 맞은 비율 / 전체데이터 개수 * 100.0
             acc = 100.0 * correct / total
+            epoch_acc = acc.item()
 
             # 모델의 학습진행상태를 출력한다.
             progress_bar(
@@ -245,65 +244,84 @@ def main():
                 ),
             )
 
-            # 모델이 예측한 정확도가 checkpoint threshold 이상이고, 이전 max를 넘었다면
-            # checkpoint를 저장한다.
-            if acc > args.checkpoint_threshold and max_accuracy < acc.item():
-                max_accuracy = round(acc.item(), 2)
-                saving_ckpt_path = Path(args.checkpoint_save_directory) / Path(
-                    f"{args.model}_{max_accuracy}.pt"
-                )
-                print(f"Saving model : {saving_ckpt_path}")
-                state = {
-                    "net": net.state_dict(),
-                    "acc": acc,
-                }
-                # checkpoint 폴더가 존재하지 않으면 만들어준다.
-                if not os.path.isdir(args.checkpoint_save_directory):
-                    os.mkdir(args.checkpoint_save_directory)
-                torch.save(state, saving_ckpt_path)
+        # 현재 에포크에서 모델이 예측한 정확도가 checkpoint threshold 이상이면
+        # checkpoint를 저장한다.
+        if epoch_acc > args.checkpoint_threshold:
+            # 체크포인트를 저장할 경로와 파일이름을 만든다.
+            rounded_accuracy = round(epoch_acc, 2)
+            saving_ckpt_path = Path(args.checkpoint_save_directory) / Path(
+                f"{args.model}_{rounded_accuracy}.pt"
+            )
 
-        return saving_ckpt_path, max_accuracy
+            print(f"Saving model : {saving_ckpt_path}")
 
-    def test(testloader, saving_ckpt_path: Path) -> None:
+            # 모델의 현재 가중치 상태와 정확도를 기록하여
+            # 체크포인트 저장 시 입력으로 들어간다.
+            state = {
+                "net": net.state_dict(),
+                "acc": epoch_acc,
+            }
+
+            # checkpoint 폴더가 존재하지 않으면 만들어준다.
+            if not os.path.isdir(args.checkpoint_save_directory):
+                os.mkdir(args.checkpoint_save_directory)
+
+            # 지정한 경로에 체크포인트를 실제로 세이브한다.
+            torch.save(state, saving_ckpt_path)
+
+    def find_files(directory, pattern):
+        """주어진 디렉토리에서 패턴에 맞는 파일들을 찾는다."""
+        for root, dirs, files in os.walk(directory):
+            for filename in fnmatch.filter(files, pattern):
+                yield os.path.join(root, filename)
+
+    def test(testloader) -> None:
         """모델 평가를 담당하는 함수"""
-        # checkpoint 가 존재하지 않는다면 테스트를 진행하지 않는 guard
-        if not (saving_ckpt_path.exists() and saving_ckpt_path.is_file()):
-            print("입력하신 체크포인트 파일이 경로에 존재하지 않습니다.")
-            return
-
         # 모델을 평가모드로 전환해서 dropout 및 gredient 변동이 일어나지 않게한다.
         net.eval()
-        print("Loading checkpoint..")
-        # 체크포인트를 load한다.
-        checkpoint = torch.load(saving_ckpt_path)
-        # load한 체크포인트를 모델에 적용한다.
-        net.load_state_dict(checkpoint["net"])
 
-        test_loss = 0
-        correct = 0
-        total = 0
-        print(f"{'-' * 10} 모델 테스트 시작 {'-' * 10}")
-        # gradient를 계산하지 않는 상태에서 모델의 정확도를 측정한다.
-        with torch.no_grad():
-            for batch_idx, (inputs, targets) in enumerate(testloader):
-                inputs, targets = inputs.to(device), targets.to(device)
-                outputs = net(inputs)
-                loss = criterion(outputs, targets)
-                test_loss += loss.item()
-                _, predicted = outputs.max(1)
-                total += targets.size(0)
-                correct += predicted.eq(targets).sum().item()
-                progress_bar(
-                    batch_idx,
-                    len(testloader),
-                    "Loss: %.3f | Acc: %.3f%% (%d/%d)"
-                    % (
-                        test_loss / (batch_idx + 1),
-                        100.0 * correct / total,
-                        correct,
-                        total,
-                    ),
-                )
+        # checkpoint들이 있는 directory에서 현재 model의 이름이 들어간
+        # 모든 checkpoint를 순회하면서 정확도를 전부 측정한다.
+        for checkpoint_path in find_files(
+            args.checkpoint_save_directory, f"*{args.model}*"
+        ):
+            print("Loading checkpoint..")
+            # 체크포인트를 load한다.
+            checkpoint = torch.load(checkpoint_path)
+            # load한 체크포인트를 모델에 적용한다.
+            net.load_state_dict(checkpoint["net"])
+
+            test_loss = 0
+            correct = 0
+            total = 0
+            print(f"{'-' * 10} 모델 테스트 시작 {'-' * 10}")
+            # gradient를 계산하지 않는 상태에서 모델의 정확도를 측정한다.
+            with torch.no_grad():
+                for batch_idx, (inputs, targets) in enumerate(testloader):
+                    inputs, targets = inputs.to(device), targets.to(device)
+                    outputs = net(inputs)
+                    loss = criterion(outputs, targets)
+                    test_loss += loss.item()
+                    _, predicted = outputs.max(1)
+                    total += targets.size(0)
+                    correct += predicted.eq(targets).sum().item()
+                    # progress_bar(
+                    #     batch_idx,
+                    #     len(testloader),
+                    #     "Loss: %.3f | Acc: %.3f%% (%d/%d)"
+                    #     % (
+                    #         test_loss / (batch_idx + 1),
+                    #         100.0 * correct / total,
+                    #         correct,
+                    #         total,
+                    #     ),
+                    # )
+
+            # 모델 정확도 측정 및 프린트
+            acc = 100.0 * correct / total
+            print(
+                f"File_path : { checkpoint_path }, Test Loss: {test_loss / len(testloader):.3f}, Test Accuracy: {acc:.2f}%"
+            )
 
     # 데이터로더를 이용해서 배치사이즈 크기별로 iterate 할 수 있도록 한다.
     # 테스트는 shuffle을 하든 안하든 상관없기 때문에 성능상의 이유로 False이고,
@@ -325,26 +343,13 @@ def main():
     # StepLR을 이용해서 에포크가 진행될수록 lr를 점점 줄이도록 한다.
     lr_sc = lr_scheduler.StepLR(optimizer, step_size=args.nsc, gamma=args.gamma)
 
-    # train
-    highest_model_path = Path("")
-    max_accuracy = 0.0
+    # training을하기 위한 for loop
     for epoch in range(0, args.ne):
-        model_path, accuracy = train(epoch, trainloader)
-        # 전체 에포크 중에서 가장 높은 정확도를 가진 모델을 구한다.
-        # 그 모델로 나중에 test함수에 넣어서 평가하기 위한 용도이다.
-        if max_accuracy < accuracy:
-            max_accuracy = accuracy
-            highest_model_path = model_path
+        train(epoch, trainloader)
         # learning rate를 줄인다.
         lr_sc.step()
 
-    if str(highest_model_path) == "":
-        print(
-            "checkpoint_threshold가 너무 높아 모델이 저장되지 않았습니다.\nthreshhold arg를 낮춰주세요."
-        )
-        return
-
-    test(testloader, highest_model_path)
+    test(testloader)
 
 
 if __name__ == "__main__":
